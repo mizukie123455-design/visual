@@ -1,0 +1,3066 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local SoundService = game:GetService("SoundService")
+local HttpService = game:GetService("HttpService")
+pcall(function()
+	if game.IsLoaded and not game:IsLoaded() then
+		game.Loaded:Wait()
+	end
+end)
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+	task.wait(0.2)
+	LocalPlayer = Players.LocalPlayer
+end
+
+local env = (getgenv and getgenv()) or _G
+local W, C, F = {}, {}, {}
+pcall(function()
+	RunService:UnbindFromRenderStep("LocalBroomVisual")
+end)
+pcall(function()
+	RunService:UnbindFromRenderStep("EmoteSwapStep")
+end)
+if env.EmoteSwapCleanup then
+	pcall(env.EmoteSwapCleanup)
+end
+
+local BAKED = {
+	sig = {
+		-- ["Items.BaseItems.Emotes.BoldMarch"] = { "89755710041366" },
+	},
+	noise = {
+		-- "17418821942",
+	},
+}
+
+local SOUND_IDS = {
+	boldmarch = "11010019801",
+	broom = "9042323118",
+}
+
+local FALLBACK_BROOM = { r6 = "112692937680187", r15 = "14159770507" }
+local SAVE_FILE = "evade_emote_swap.json"
+
+local USE_REQUIRE = true
+
+local enabled, soundOn, force = false, true, false
+local building, showing = false, false
+local learn = nil
+local emotes, byId = {}, {}
+local src, tgt = nil, nil
+local variant = "auto"
+local animList, rigsNow = {}, {}
+local lastRefresh, lastProp, nextTry, lastCos = 0, 0, 0, 0
+local visuals = {}
+local visualToken = nil
+local showSince = nil
+local hasProp = false
+local ducked, duckConns, duckReady = {}, {}, false
+local localSound, localBase = nil, 1
+local sigDB, noise = {}, {}
+local sigCache, sigDirty = nil, true
+local ownIds = {}
+local pre = {}
+local hiddenProps = {}
+local pickerFor = nil
+local propInFolder, propFails = false, 0
+local propOff = {}
+local lastErr = nil
+
+local cosItems, cosById = {}, {}
+local worn = { cosmetic = {}, character = nil, unusual = nil }
+local cosOn, hideOwn = false, false
+local cosCat = "cosmetic"
+local cosState = {}
+local hiddenCos = {}
+local hideMode = ""
+local ourSet = {}
+
+local RANK = { Idle = 1, Movement = 2, Action = 3, Action2 = 4, Action3 = 5, Action4 = 6 }
+local RANK_ACTION = 3
+
+local function norm(s)
+	return (tostring(s or ""):lower():gsub("[^%w]", ""))
+end
+
+local function numId(s)
+	return tostring(s or ""):match("(%d+)")
+end
+
+local function asset(id)
+	local n = numId(id)
+	if not n or n == "" then
+		return tostring(id or "")
+	end
+	return "rbxassetid://" .. n
+end
+
+local function prettyName(n)
+	return (tostring(n):gsub("(%l)(%u)", "%1 %2"))
+end
+
+local function isR15(model)
+	local hum = model and model:FindFirstChildOfClass("Humanoid")
+	return hum ~= nil and hum.RigType == Enum.HumanoidRigType.R15
+end
+
+local function relNames(inst, ancestor)
+	local names = {}
+	local cur = inst
+	while cur and cur ~= ancestor do
+		table.insert(names, 1, cur.Name)
+		cur = cur.Parent
+	end
+	if cur ~= ancestor then
+		return nil
+	end
+	return names
+end
+
+local function getFolder()
+	local folder = workspace:FindFirstChild("LocalBroomFolder")
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = "LocalBroomFolder"
+		folder.Parent = workspace
+	end
+	return folder
+end
+
+local function findRoot(model)
+	if not model then
+		return nil
+	end
+	if model.PrimaryPart then
+		return model.PrimaryPart
+	end
+	for _, n in ipairs({ "HumanoidRootPart", "TorsoRot", "Torso" }) do
+		local p = model:FindFirstChild(n)
+		if p and p:IsA("BasePart") then
+			return p
+		end
+	end
+	return nil
+end
+
+local function findTorso(model)
+	for _, n in ipairs({ "Torso", "UpperTorso", "LowerTorso" }) do
+		local p = model:FindFirstChild(n, true)
+		if p and p:IsA("BasePart") then
+			return p
+		end
+	end
+	return findRoot(model)
+end
+
+local function indexOf(t, v)
+	for i, x in ipairs(t) do
+		if x == v then
+			return i
+		end
+	end
+	return nil
+end
+
+----------------------------------------------------------------------
+-- Прикрепление моделей к ригу (реквизит эмоций, косметика, скины, эффекты)
+----------------------------------------------------------------------
+-- имя части-пустышки в шаблоне -> подходящие части настоящего рига (по порядку)
+local BODY = {
+	Head = { "Head" },
+	Torso = { "Torso", "UpperTorso", "LowerTorso" },
+	UpperTorso = { "UpperTorso", "Torso" },
+	LowerTorso = { "LowerTorso", "Torso", "UpperTorso" },
+	TorsoRot = { "TorsoRot", "Torso", "UpperTorso" },
+	HumanoidRootPart = { "HumanoidRootPart", "Torso", "LowerTorso" },
+	["Left Arm"] = { "Left Arm", "LeftHand", "LeftLowerArm", "LeftUpperArm" },
+	["Right Arm"] = { "Right Arm", "RightHand", "RightLowerArm", "RightUpperArm" },
+	["Left Leg"] = { "Left Leg", "LeftFoot", "LeftLowerLeg", "LeftUpperLeg" },
+	["Right Leg"] = { "Right Leg", "RightFoot", "RightLowerLeg", "RightUpperLeg" },
+	LeftHand = { "LeftHand", "Left Arm", "LeftLowerArm" },
+	RightHand = { "RightHand", "Right Arm", "RightLowerArm" },
+	LeftLowerArm = { "LeftLowerArm", "Left Arm", "LeftHand" },
+	RightLowerArm = { "RightLowerArm", "Right Arm", "RightHand" },
+	LeftUpperArm = { "LeftUpperArm", "Left Arm" },
+	RightUpperArm = { "RightUpperArm", "Right Arm" },
+	LeftFoot = { "LeftFoot", "Left Leg", "LeftLowerLeg" },
+	RightFoot = { "RightFoot", "Right Leg", "RightLowerLeg" },
+	LeftLowerLeg = { "LeftLowerLeg", "Left Leg", "LeftFoot" },
+	RightLowerLeg = { "RightLowerLeg", "Right Leg", "RightFoot" },
+	LeftUpperLeg = { "LeftUpperLeg", "Left Leg" },
+	RightUpperLeg = { "RightUpperLeg", "Right Leg" },
+}
+
+local MOVABLE = {
+	"Attachment", "ParticleEmitter", "Light", "Beam", "Trail", "Fire",
+	"Smoke", "Sparkles", "Highlight", "Decal", "Texture", "SpecialMesh",
+}
+
+function F.movable(i)
+	for _, c in ipairs(MOVABLE) do
+		if i:IsA(c) then
+			return true
+		end
+	end
+	return false
+end
+
+function F.isJoint(i)
+	return i:IsA("JointInstance") or i:IsA("WeldConstraint")
+end
+
+function F.isOur(p)
+	local cur = p
+	while cur do
+		if ourSet[cur] then
+			return true
+		end
+		cur = cur.Parent
+	end
+	return false
+end
+
+function F.rigPartFor(rig, name)
+	local list = BODY[name] or { name }
+	for _, n in ipairs(list) do
+		local p = rig:FindFirstChild(n)
+		if not (p and p:IsA("BasePart") and not F.isOur(p)) then
+			p = nil
+			for _, d in ipairs(rig:GetDescendants()) do
+				if d.Name == n and d:IsA("BasePart") and not F.isOur(d) then
+					p = d
+					break
+				end
+			end
+		end
+		if p then
+			return p
+		end
+	end
+	return nil
+end
+
+function F.fixPart(p)
+	p.Anchored = false
+	p.CanCollide = false
+	p.Massless = true
+	p.CanQuery = false
+	p.CanTouch = false
+end
+
+function F.primaryOf(top)
+	if top:IsA("BasePart") then
+		return top
+	end
+	if top:IsA("Model") and top.PrimaryPart then
+		return top.PrimaryPart
+	end
+	return top:FindFirstChildWhichIsA("BasePart", true)
+end
+
+function F.destroyHandle(h)
+	if not h then
+		return
+	end
+	for _, i in ipairs(h.items) do
+		ourSet[i] = nil
+		pcall(function()
+			i:Destroy()
+		end)
+	end
+	ourSet[h.container] = nil
+	pcall(function()
+		h.container:Destroy()
+	end)
+end
+
+-- Главная функция. Берёт шаблон (Character / CharacterClassic), заменяет части-пустышки
+-- на настоящие части рига и вешает всё остальное (реквизит, аксессуары, частицы) на риг.
+-- opts: name, parent, pick (имя модели внутри шаблона), skin (персонаж целиком),
+--       animated (Motor6D для анимации), fbCF (запасное крепление к торсу)
+function F.graft(root, rig, opts)
+	opts = opts or {}
+	local hum = rig:FindFirstChildOfClass("Humanoid")
+	local JC = opts.animated and "Motor6D" or "Weld"
+	local cl = root:Clone()
+	for _, d in ipairs(cl:GetDescendants()) do
+		if d:IsA("LuaSourceContainer") then
+			pcall(function()
+				d:Destroy()
+			end)
+		end
+	end
+	if opts.pick then
+		local em = cl:FindFirstChild(opts.pick, true)
+		if not em then
+			cl:Destroy()
+			return nil
+		end
+		local holder = Instance.new("Model")
+		em.Parent = holder
+		cl:Destroy()
+		cl = holder
+	end
+
+	local container = Instance.new("Folder")
+	container.Name = opts.name or "LocalVisualProp"
+	container.Parent = opts.parent or getFolder()
+	ourSet[container] = true
+	local h = { container = container, items = {}, exact = 0, parts = 0, notes = {}, firstJoint = nil, rigJoints = {} }
+	local function track(i)
+		table.insert(h.items, i)
+		ourSet[i] = true
+	end
+	local function note(s)
+		if #h.notes < 12 then
+			table.insert(h.notes, s)
+		end
+	end
+	local function recordRigJoint(j, rigIsP0)
+		table.insert(h.rigJoints, { j = j, rigIsP0 = rigIsP0, c0 = j.C0, c1 = j.C1 })
+		if not h.firstJoint then
+			h.firstJoint = j
+		end
+		h.exact = h.exact + 1
+	end
+
+	-- части-пустышки (тело в шаблоне)
+	local dummy, dummyCF = {}, {}
+	if not opts.skin then
+		for _, t in ipairs(cl:GetChildren()) do
+			if BODY[t.Name] and (t:IsA("BasePart") or t:IsA("Model") or t:IsA("Folder")) then
+				if not (t:IsA("Model") and t:FindFirstChildOfClass("Humanoid")) then
+					dummy[t] = true
+					if t:IsA("BasePart") then
+						dummyCF[t.Name] = t.CFrame
+					end
+				end
+			end
+		end
+	end
+	local function topOf(x)
+		local cur = x
+		while cur and cur.Parent ~= cl do
+			cur = cur.Parent
+		end
+		return cur
+	end
+	local function dummyTopOf(x)
+		local t = topOf(x)
+		if t and dummy[t] then
+			return t
+		end
+		return nil
+	end
+	local function kindOf(p)
+		if not p then
+			return "nil"
+		end
+		if p == cl or p:IsDescendantOf(cl) then
+			if dummyTopOf(p) then
+				return "dummy"
+			end
+			return "prop"
+		end
+		return "outside"
+	end
+	local function addAcc(acc)
+		acc.Parent = nil
+		local ok = false
+		if hum then
+			ok = pcall(function()
+				hum:AddAccessory(acc)
+			end)
+		end
+		if ok then
+			track(acc)
+			h.exact = h.exact + 1
+		else
+			acc.Parent = container
+		end
+	end
+
+	-- 1. связки между реквизитом и телом -> перевешиваем на настоящие части рига
+	local connected, links = {}, {}
+	local function markConn(p)
+		local t = p and topOf(p)
+		if t then
+			connected[t] = true
+		end
+	end
+	local joints = {}
+	for _, d in ipairs(cl:GetDescendants()) do
+		if F.isJoint(d) then
+			table.insert(joints, d)
+		end
+	end
+	for _, d in ipairs(joints) do
+		local p0, p1 = d.Part0, d.Part1
+		local k0, k1 = kindOf(p0), kindOf(p1)
+		local pr0, pr1 = (k0 == "prop"), (k1 == "prop")
+		if pr0 ~= pr1 then
+			local other = pr0 and p1 or p0
+			local okind = pr0 and k1 or k0
+			local propPart = pr0 and p0 or p1
+			local nm
+			if other then
+				local dt = (okind == "dummy") and dummyTopOf(other) or nil
+				nm = (BODY[other.Name] and other.Name) or (dt and dt.Name) or other.Name
+			else
+				nm = BODY[d.Name] and d.Name or "Torso"
+			end
+			local rp = F.rigPartFor(rig, nm)
+			if not rp then
+				rp = findTorso(rig)
+				note("нет части '" .. nm .. "' у рига, взят торс")
+			end
+			if rp then
+				local nj = d
+				if d:IsA("WeldConstraint") then
+					nj = Instance.new(JC)
+					nj.Name = "LocalVisualJoint"
+					local rel = CFrame.new()
+					if p0 and p1 then
+						rel = p0.CFrame:ToObjectSpace(p1.CFrame)
+					end
+					nj.C0 = rel
+					nj.C1 = CFrame.new()
+				end
+				if pr0 then
+					nj.Part0 = propPart
+					nj.Part1 = rp
+				else
+					nj.Part0 = rp
+					nj.Part1 = propPart
+				end
+				nj.Parent = rp
+				if nj ~= d then
+					d:Destroy()
+				end
+				track(nj)
+				recordRigJoint(nj, not pr0)
+				markConn(propPart)
+				note(nj.Name .. ": " .. rp.Name .. " <-> " .. propPart.Name .. " (шаблон: " .. nm .. ")")
+			else
+				d:Destroy()
+			end
+		elseif pr0 and pr1 then
+			table.insert(links, { topOf(p0), topOf(p1) })
+		else
+			d:Destroy()
+		end
+	end
+
+	-- 1b. скин персонажа: части тела шаблона приваривается к частям рига
+	if opts.skin then
+		local bodyParts, isBody = {}, {}
+		for _, p in ipairs(cl:GetDescendants()) do
+			if p:IsA("BasePart") and BODY[p.Name] and not p:FindFirstAncestorOfClass("Accessory") then
+				table.insert(bodyParts, p)
+				isBody[p] = true
+			end
+		end
+		for _, d in ipairs(cl:GetDescendants()) do
+			if F.isJoint(d) and d.Part0 and d.Part1 and isBody[d.Part0] and isBody[d.Part1] then
+				d:Destroy()
+			end
+		end
+		for _, p in ipairs(bodyParts) do
+			local rp = F.rigPartFor(rig, p.Name)
+			if rp then
+				local j = Instance.new("Weld")
+				j.Name = "LocalSkinJoint"
+				j.Part0 = rp
+				j.Part1 = p
+				j.C0 = CFrame.new()
+				j.C1 = CFrame.new()
+				j.Parent = rp
+				track(j)
+				h.exact = h.exact + 1
+				markConn(p)
+			else
+				p:Destroy()
+			end
+		end
+	end
+
+	-- связанные между собой части считаем подключёнными
+	local changed = true
+	while changed do
+		changed = false
+		for _, l in ipairs(links) do
+			if l[1] and l[2] and ((connected[l[1]] or false) ~= (connected[l[2]] or false)) then
+				connected[l[1]] = true
+				connected[l[2]] = true
+				changed = true
+			end
+		end
+	end
+
+	-- 2. содержимое пустышек (частицы, аттачменты, декали) -> на настоящие части
+	for top in pairs(dummy) do
+		local rp = F.rigPartFor(rig, top.Name)
+		for _, ch in ipairs(top:GetChildren()) do
+			if F.isJoint(ch) then
+				-- уже обработано
+			elseif ch:IsA("Accessory") then
+				addAcc(ch)
+			elseif ch:IsA("BasePart") or ch:IsA("Model") then
+				ch.Parent = container
+			elseif F.movable(ch) and rp then
+				ch.Parent = rp
+				track(ch)
+			end
+		end
+	end
+
+	-- 3. остальное из шаблона
+	for _, ch in ipairs(cl:GetChildren()) do
+		if dummy[ch] then
+			ch:Destroy()
+		elseif ch:IsA("Accessory") then
+			addAcc(ch)
+		elseif ch:IsA("Model") and ch:FindFirstChildOfClass("Humanoid") and not opts.skin then
+			ch:Destroy()
+		elseif ch:IsA("BasePart") or ch:IsA("Model") or ch:IsA("Folder") or F.isJoint(ch) then
+			ch.Parent = container
+		elseif F.movable(ch) then
+			local rp = F.rigPartFor(rig, "Torso")
+			if rp then
+				ch.Parent = rp
+				track(ch)
+			else
+				ch:Destroy()
+			end
+		else
+			ch:Destroy()
+		end
+	end
+	cl:Destroy()
+
+	for _, p in ipairs(container:GetDescendants()) do
+		if p:IsA("BasePart") then
+			F.fixPart(p)
+			h.parts = h.parts + 1
+		end
+	end
+	for _, i in ipairs(h.items) do
+		if i:IsA("Accessory") then
+			for _, p in ipairs(i:GetDescendants()) do
+				if p:IsA("BasePart") then
+					p.CanCollide = false
+					p.Massless = true
+					h.parts = h.parts + 1
+				end
+			end
+		end
+	end
+
+	-- 4. запасные способы для частей, у которых нет связки с ригом
+	if opts.fbCF and not opts.skin then
+		for _, top in ipairs(container:GetChildren()) do
+			if not connected[top] and not F.isJoint(top) then
+				local pp = F.primaryOf(top)
+				if pp then
+					local done = false
+					-- 4a. совпадающие по имени аттачменты (точка крепления есть и у рига, и у предмета)
+					for _, a in ipairs(top:GetDescendants()) do
+						if a:IsA("Attachment") and a.Parent and a.Parent:IsA("BasePart") then
+							local ra = rig:FindFirstChild(a.Name, true)
+							if ra and ra:IsA("Attachment") and ra.Parent and ra.Parent:IsA("BasePart") and not F.isOur(ra) then
+								local j = Instance.new(JC)
+								j.Name = "LocalVisualJoint"
+								j.Part0 = ra.Parent
+								j.Part1 = a.Parent
+								j.C0 = ra.CFrame
+								j.C1 = a.CFrame
+								j.Parent = ra.Parent
+								track(j)
+								recordRigJoint(j, true)
+								note("крепление по аттачменту " .. a.Name)
+								done = true
+								break
+							end
+						end
+					end
+					-- 4b. смещение относительно пустышки в шаблоне
+					if not done then
+						local dname, dcf
+						for _, nm in ipairs({ "HumanoidRootPart", "Torso", "UpperTorso", "LowerTorso" }) do
+							if dummyCF[nm] then
+								dname, dcf = nm, dummyCF[nm]
+								break
+							end
+						end
+						if not dname then
+							for nm, cf in pairs(dummyCF) do
+								dname, dcf = nm, cf
+								break
+							end
+						end
+						local rp = dname and F.rigPartFor(rig, dname)
+						if rp and dcf then
+							local j = Instance.new(JC)
+							j.Name = "LocalVisualJoint"
+							j.Part0 = rp
+							j.Part1 = pp
+							j.C0 = dcf:ToObjectSpace(pp.CFrame)
+							j.C1 = CFrame.new()
+							j.Parent = rp
+							track(j)
+							recordRigJoint(j, true)
+							note("крепление по смещению от " .. dname)
+							done = true
+						end
+					end
+					-- 4c. совсем запасной вариант: к торсу
+					if not done then
+						local torso = findTorso(rig)
+						if torso then
+							local j = Instance.new(JC)
+							j.Name = "LocalVisualJoint"
+							j.Part0 = torso
+							j.Part1 = pp
+							j.C0 = opts.fbCF
+							j.C1 = CFrame.new()
+							j.Parent = torso
+							track(j)
+							if not h.firstJoint then
+								h.firstJoint = j
+							end
+							table.insert(h.rigJoints, { j = j, rigIsP0 = true, c0 = j.C0, c1 = j.C1 })
+							note("запасное крепление к торсу (подстрой кнопками)")
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if #container:GetChildren() == 0 and #h.items == 0 then
+		F.destroyHandle(h)
+		return nil
+	end
+	return h
+end
+
+-- пробует Character / CharacterClassic в нужном порядке, потом остальные способы
+function F.graftBest(mod, rig, preferC, name, opts)
+	opts = opts or {}
+	local c, cc = mod:FindFirstChild("Character"), mod:FindFirstChild("CharacterClassic")
+	local a, b = c, cc
+	if not preferC then
+		a, b = cc, c
+	end
+	local roots = {}
+	if a then
+		table.insert(roots, { root = a })
+	end
+	if b then
+		table.insert(roots, { root = b })
+	end
+	if opts.pickName and mod:FindFirstChild(opts.pickName, true) then
+		table.insert(roots, { root = mod, pick = opts.pickName })
+	end
+	if #roots == 0 and opts.allowSelf then
+		table.insert(roots, { root = mod })
+	end
+	local fallbackH = nil
+	for _, r in ipairs(roots) do
+		local h = F.graft(r.root, rig, {
+			name = name,
+			parent = opts.parent,
+			skin = opts.skin,
+			animated = opts.animated,
+			pick = r.pick,
+			fbCF = opts.fbCF,
+		})
+		if h then
+			if h.exact > 0 or h.parts == 0 then
+				if fallbackH then
+					F.destroyHandle(fallbackH)
+				end
+				return h
+			end
+			if not fallbackH then
+				fallbackH = h
+			else
+				F.destroyHandle(h)
+			end
+		end
+	end
+	return fallbackH
+end
+
+-- ручная подстройка реквизита
+function F.applyOffset(h, off)
+	if not h or not h.rigJoints then
+		return
+	end
+	local o = CFrame.new()
+	if off then
+		o = CFrame.new(off.x, off.y, off.z) * CFrame.Angles(0, math.rad(off.r), 0)
+	end
+	for _, rj in ipairs(h.rigJoints) do
+		if rj.j and rj.j.Parent then
+			if rj.rigIsP0 then
+				rj.j.C0 = rj.c0 * o
+			else
+				rj.j.C1 = rj.c1 * o:Inverse()
+			end
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- UI
+----------------------------------------------------------------------
+local function guiParent()
+	local ok, hui = pcall(function()
+		return gethui and gethui()
+	end)
+	if ok and typeof(hui) == "Instance" then
+		return hui
+	end
+	local ok2, core = pcall(function()
+		return game:GetService("CoreGui")
+	end)
+	if ok2 and core then
+		return core
+	end
+	return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local parent = guiParent()
+local oldGui = parent:FindFirstChild("EvadeEmoteSwap")
+if oldGui then
+	oldGui:Destroy()
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "EvadeEmoteSwap"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 1000
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = parent
+pcall(function()
+	if syn and syn.protect_gui then
+		syn.protect_gui(gui)
+	end
+end)
+
+C.BG = Color3.fromRGB(22, 22, 28)
+C.PANEL = Color3.fromRGB(32, 32, 40)
+C.ON = Color3.fromRGB(46, 160, 96)
+C.TEXT = Color3.fromRGB(236, 236, 242)
+C.MUTED = Color3.fromRGB(155, 155, 170)
+C.OFFBTN = Color3.fromRGB(55, 48, 78)
+C.DARK = Color3.fromRGB(14, 14, 18)
+
+local function corner(obj, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r)
+	c.Parent = obj
+end
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(380, 0)
+main.AutomaticSize = Enum.AutomaticSize.Y
+main.Position = UDim2.new(0, 24, 0, 80)
+main.BackgroundColor3 = C.BG
+main.BorderSizePixel = 0
+main.Active = true
+main.Parent = gui
+corner(main, 12)
+W.stroke = Instance.new("UIStroke")
+W.stroke.Color = Color3.fromRGB(70, 60, 110)
+W.stroke.Thickness = 1
+W.stroke.Parent = main
+W.pad = Instance.new("UIPadding")
+W.pad.PaddingTop = UDim.new(0, 10)
+W.pad.PaddingBottom = UDim.new(0, 12)
+W.pad.PaddingLeft = UDim.new(0, 12)
+W.pad.PaddingRight = UDim.new(0, 12)
+W.pad.Parent = main
+local list = Instance.new("UIListLayout")
+list.Padding = UDim.new(0, 8)
+list.SortOrder = Enum.SortOrder.LayoutOrder
+list.Parent = main
+
+local groups = { emote = {}, cos = {}, common = {} }
+local function reg(g, o)
+	table.insert(groups[g], o)
+	return o
+end
+
+local function makeLabel(text, order, color, h)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Size = UDim2.new(1, 0, 0, h or 18)
+	l.Font = Enum.Font.GothamMedium
+	l.TextSize = 13
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.TextYAlignment = Enum.TextYAlignment.Top
+	l.TextWrapped = true
+	l.TextColor3 = color or C.MUTED
+	l.Text = text
+	l.LayoutOrder = order
+	l.Parent = main
+	return l
+end
+
+W.header = Instance.new("Frame")
+W.header.BackgroundTransparency = 1
+W.header.Size = UDim2.new(1, 0, 0, 26)
+W.header.LayoutOrder = 1
+W.header.Parent = main
+
+W.title = Instance.new("TextLabel")
+W.title.BackgroundTransparency = 1
+W.title.Size = UDim2.new(1, -70, 1, 0)
+W.title.Font = Enum.Font.GothamBold
+W.title.TextSize = 16
+W.title.TextXAlignment = Enum.TextXAlignment.Left
+W.title.TextColor3 = C.TEXT
+W.title.Text = "Evade Visual Swap by Mizukiee"
+W.title.Parent = W.header
+
+W.hideBtn = Instance.new("TextButton")
+W.hideBtn.Size = UDim2.fromOffset(28, 22)
+W.hideBtn.Position = UDim2.new(1, -62, 0, 0)
+W.hideBtn.BackgroundColor3 = C.PANEL
+W.hideBtn.Text = "_"
+W.hideBtn.Font = Enum.Font.GothamBold
+W.hideBtn.TextSize = 14
+W.hideBtn.TextColor3 = C.TEXT
+W.hideBtn.Parent = W.header
+corner(W.hideBtn, 6)
+
+W.closeBtn = Instance.new("TextButton")
+W.closeBtn.Size = UDim2.fromOffset(28, 22)
+W.closeBtn.Position = UDim2.new(1, -28, 0, 0)
+W.closeBtn.BackgroundColor3 = Color3.fromRGB(90, 40, 50)
+W.closeBtn.Text = "X"
+W.closeBtn.Font = Enum.Font.GothamBold
+W.closeBtn.TextSize = 13
+W.closeBtn.TextColor3 = C.TEXT
+W.closeBtn.Parent = W.header
+corner(W.closeBtn, 6)
+
+W.tabsRow = reg("common", Instance.new("Frame"))
+W.tabsRow.BackgroundTransparency = 1
+W.tabsRow.Size = UDim2.new(1, 0, 0, 30)
+W.tabsRow.LayoutOrder = 2
+W.tabsRow.Parent = main
+
+local function mkTab(text, x)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(0.49, 0, 1, 0)
+	b.Position = UDim2.new(x, 0, 0, 0)
+	b.BackgroundColor3 = C.PANEL
+	b.Text = text
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 13
+	b.TextColor3 = C.TEXT
+	b.Parent = W.tabsRow
+	corner(b, 8)
+	return b
+end
+W.tabEmoteBtn = mkTab("Эмоции", 0)
+W.tabCosBtn = mkTab("Косметика / эффекты", 0.51)
+
+W.status = reg("common", makeLabel("Загружаю списки...", 3, C.MUTED, 32))
+reg("common", makeLabel("Это визуалка, другие игроки ничо не видят.", 4, C.MUTED, 32))
+
+local function wideBtn(text, order, g)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, 0, 0, 34)
+	b.BackgroundColor3 = C.PANEL
+	b.Text = text
+	b.Font = Enum.Font.GothamMedium
+	b.TextSize = 13
+	b.TextColor3 = C.TEXT
+	b.LayoutOrder = order
+	b.Parent = main
+	corner(b, 8)
+	reg(g, b)
+	return b
+end
+
+local function mkRow(order, g)
+	local r = Instance.new("Frame")
+	r.BackgroundTransparency = 1
+	r.Size = UDim2.new(1, 0, 0, 32)
+	r.LayoutOrder = order
+	r.Parent = main
+	reg(g, r)
+	return r
+end
+
+local function smallBtn(row, text, x, w, ts)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(w, 0, 1, 0)
+	b.Position = UDim2.new(x, 0, 0, 0)
+	b.BackgroundColor3 = C.PANEL
+	b.Text = text
+	b.Font = Enum.Font.GothamMedium
+	b.TextSize = ts or 12
+	b.TextColor3 = C.TEXT
+	b.Parent = row
+	corner(b, 8)
+	return b
+end
+
+---------------- вкладка эмоций ----------------
+W.srcBtn = wideBtn("Что нажимаю: ...", 5, "emote")
+W.tgtBtn = wideBtn("Что показать: ...", 6, "emote")
+
+W.picker = Instance.new("Frame")
+W.picker.Size = UDim2.new(1, 0, 0, 230)
+W.picker.BackgroundColor3 = C.DARK
+W.picker.Visible = false
+W.picker.LayoutOrder = 7
+W.picker.Parent = main
+corner(W.picker, 8)
+
+W.searchBox = Instance.new("TextBox")
+W.searchBox.Size = UDim2.new(1, -12, 0, 28)
+W.searchBox.Position = UDim2.fromOffset(6, 6)
+W.searchBox.PlaceholderText = "поиск по названию..."
+W.searchBox.Text = ""
+W.searchBox.ClearTextOnFocus = false
+W.searchBox.BackgroundColor3 = C.PANEL
+W.searchBox.TextColor3 = C.TEXT
+W.searchBox.Font = Enum.Font.Gotham
+W.searchBox.TextSize = 13
+W.searchBox.Parent = W.picker
+corner(W.searchBox, 6)
+
+W.listFrame = Instance.new("ScrollingFrame")
+W.listFrame.Position = UDim2.fromOffset(6, 40)
+W.listFrame.Size = UDim2.new(1, -12, 1, -46)
+W.listFrame.BackgroundTransparency = 1
+W.listFrame.BorderSizePixel = 0
+W.listFrame.ScrollBarThickness = 4
+W.listFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+W.listFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+W.listFrame.Parent = W.picker
+W.listLayout = Instance.new("UIListLayout")
+W.listLayout.Padding = UDim.new(0, 2)
+W.listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+W.listLayout.Parent = W.listFrame
+
+W.toggle = wideBtn("ВЫКЛ  -  нажми, чтобы включить подмену", 8, "emote")
+W.toggle.BackgroundColor3 = C.OFFBTN
+W.toggle.Font = Enum.Font.GothamBold
+W.toggle.Size = UDim2.new(1, 0, 0, 36)
+
+W.soundBtn = wideBtn("Звук: ВКЛ", 9, "emote")
+W.soundBtn.BackgroundColor3 = C.ON
+W.soundBtn.Size = UDim2.new(1, 0, 0, 32)
+
+W.row1 = mkRow(10, "emote")
+W.noiseBtn = smallBtn(W.row1, "1. Записать шум", 0, 0.48)
+W.learnBtn = smallBtn(W.row1, "2. Запомнить id", 0.52, 0.48)
+
+W.row2 = mkRow(11, "emote")
+W.testBtn = smallBtn(W.row2, "Тест: ВЫКЛ", 0, 0.48)
+W.variantBtn = smallBtn(W.row2, "Анимация: авто", 0.52, 0.48)
+
+W.row3 = mkRow(12, "emote")
+W.exportBtn = smallBtn(W.row3, "Экспорт данных", 0, 0.48)
+W.copyBtn = smallBtn(W.row3, "Копировать лог", 0.52, 0.48)
+
+W.propLabel = makeLabel("Подстройка реквизита (включи Тест, чтобы видеть):", 13, C.MUTED, 18)
+reg("emote", W.propLabel)
+W.rowP1 = mkRow(14, "emote")
+W.pLeft = smallBtn(W.rowP1, "Лево", 0, 0.158, 11)
+W.pRight = smallBtn(W.rowP1, "Право", 0.168, 0.158, 11)
+W.pDown = smallBtn(W.rowP1, "Вниз", 0.336, 0.158, 11)
+W.pUp = smallBtn(W.rowP1, "Вверх", 0.504, 0.158, 11)
+W.pFwd = smallBtn(W.rowP1, "Вперёд", 0.672, 0.158, 11)
+W.pBack = smallBtn(W.rowP1, "Назад", 0.84, 0.158, 11)
+W.rowP2 = mkRow(15, "emote")
+W.pRotL = smallBtn(W.rowP2, "Поворот-", 0, 0.235, 11)
+W.pRotR = smallBtn(W.rowP2, "Поворот+", 0.255, 0.235, 11)
+W.pReset = smallBtn(W.rowP2, "Сброс", 0.51, 0.235, 11)
+W.pDump = smallBtn(W.rowP2, "Дамп", 0.765, 0.235, 11)
+
+---------------- вкладка косметики / эффектов ----------------
+W.cosInfo = makeLabel("Выбери раздел, нажми на предмет чтобы надеть/снять. Слоты: 3 косметики, 1 персонаж, 1 эффект. Потом ВКЛ.", 5, C.MUTED, 48)
+reg("cos", W.cosInfo)
+
+W.catRow = mkRow(6, "cos")
+W.catCosBtn = smallBtn(W.catRow, "Косметика", 0, 0.325)
+W.catCharBtn = smallBtn(W.catRow, "Персонаж", 0.3375, 0.325)
+W.catFxBtn = smallBtn(W.catRow, "Эффект", 0.675, 0.325)
+
+W.cosSearch = Instance.new("TextBox")
+W.cosSearch.Size = UDim2.new(1, 0, 0, 28)
+W.cosSearch.PlaceholderText = "поиск по названию или папке..."
+W.cosSearch.Text = ""
+W.cosSearch.ClearTextOnFocus = false
+W.cosSearch.BackgroundColor3 = C.PANEL
+W.cosSearch.TextColor3 = C.TEXT
+W.cosSearch.Font = Enum.Font.Gotham
+W.cosSearch.TextSize = 13
+W.cosSearch.LayoutOrder = 7
+W.cosSearch.Parent = main
+corner(W.cosSearch, 6)
+reg("cos", W.cosSearch)
+
+W.cosList = Instance.new("ScrollingFrame")
+W.cosList.Size = UDim2.new(1, 0, 0, 210)
+W.cosList.BackgroundColor3 = C.DARK
+W.cosList.BorderSizePixel = 0
+W.cosList.ScrollBarThickness = 4
+W.cosList.CanvasSize = UDim2.new(0, 0, 0, 0)
+W.cosList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+W.cosList.LayoutOrder = 8
+W.cosList.Parent = main
+corner(W.cosList, 8)
+W.cosListPad = Instance.new("UIPadding")
+W.cosListPad.PaddingTop = UDim.new(0, 4)
+W.cosListPad.PaddingLeft = UDim.new(0, 4)
+W.cosListPad.PaddingRight = UDim.new(0, 4)
+W.cosListPad.Parent = W.cosList
+W.cosListLayout = Instance.new("UIListLayout")
+W.cosListLayout.Padding = UDim.new(0, 2)
+W.cosListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+W.cosListLayout.Parent = W.cosList
+reg("cos", W.cosList)
+
+W.cosCount = makeLabel("", 9, C.MUTED, 16)
+W.cosCount.TextSize = 12
+reg("cos", W.cosCount)
+W.cosWornLabel = makeLabel("Надето: ничего", 10, C.TEXT, 62)
+reg("cos", W.cosWornLabel)
+
+W.cosToggle = wideBtn("ВЫКЛ  -  нажми, чтобы показать", 11, "cos")
+W.cosToggle.BackgroundColor3 = C.OFFBTN
+W.cosToggle.Font = Enum.Font.GothamBold
+W.cosToggle.Size = UDim2.new(1, 0, 0, 36)
+
+W.cosRow = mkRow(12, "cos")
+W.cosClearBtn = smallBtn(W.cosRow, "Снять всё", 0, 0.48)
+W.cosHideBtn = smallBtn(W.cosRow, "Скрыть мои: ВЫКЛ", 0.52, 0.48)
+
+---------------- общий лог ----------------
+reg("common", makeLabel("Лог", 30))
+W.logBox = Instance.new("TextBox")
+W.logBox.Size = UDim2.new(1, 0, 0, 150)
+W.logBox.BackgroundColor3 = C.DARK
+W.logBox.Text = ""
+W.logBox.TextEditable = false
+W.logBox.ClearTextOnFocus = false
+W.logBox.MultiLine = true
+W.logBox.TextWrapped = true
+W.logBox.TextYAlignment = Enum.TextYAlignment.Top
+W.logBox.TextXAlignment = Enum.TextXAlignment.Left
+W.logBox.Font = Enum.Font.Code
+W.logBox.TextSize = 12
+W.logBox.TextColor3 = Color3.fromRGB(190, 230, 190)
+W.logBox.LayoutOrder = 31
+W.logBox.Parent = main
+corner(W.logBox, 8)
+W.lp = Instance.new("UIPadding")
+W.lp.PaddingTop = UDim.new(0, 6)
+W.lp.PaddingLeft = UDim.new(0, 6)
+W.lp.PaddingRight = UDim.new(0, 6)
+W.lp.Parent = W.logBox
+reg("common", W.logBox)
+
+local logLines = {}
+local function log(msg)
+	print("[swap] " .. tostring(msg))
+	table.insert(logLines, tostring(msg))
+	if #logLines > 150 then
+		table.remove(logLines, 1)
+	end
+	W.logBox.Text = table.concat(logLines, "\n")
+end
+
+local function setStatus(text, good)
+	W.status.Text = text
+	W.status.TextColor3 = good and Color3.fromRGB(130, 220, 160) or C.MUTED
+end
+
+function F.paintToggle()
+	if enabled then
+		W.toggle.BackgroundColor3 = C.ON
+		W.toggle.Text = "ВКЛ  -  жми выбранную эмоцию"
+	else
+		W.toggle.BackgroundColor3 = C.OFFBTN
+		W.toggle.Text = "ВЫКЛ  -  нажми, чтобы включить подмену"
+	end
+end
+
+function F.paintCosToggle()
+	if cosOn then
+		W.cosToggle.BackgroundColor3 = C.ON
+		W.cosToggle.Text = "ВКЛ  -  выбранное показано"
+	else
+		W.cosToggle.BackgroundColor3 = C.OFFBTN
+		W.cosToggle.Text = "ВЫКЛ  -  нажми, чтобы показать"
+	end
+	W.cosHideBtn.Text = "Скрыть мои: " .. (hideOwn and "ВКЛ" or "ВЫКЛ")
+	W.cosHideBtn.BackgroundColor3 = hideOwn and C.ON or C.PANEL
+	W.catCosBtn.BackgroundColor3 = cosCat == "cosmetic" and C.ON or C.PANEL
+	W.catCharBtn.BackgroundColor3 = cosCat == "character" and C.ON or C.PANEL
+	W.catFxBtn.BackgroundColor3 = cosCat == "unusual" and C.ON or C.PANEL
+end
+
+local currentTab, collapsed = "emote", false
+function F.applyTabs()
+	for g, l in pairs(groups) do
+		for _, o in ipairs(l) do
+			if g == "common" then
+				o.Visible = not collapsed
+			else
+				o.Visible = (not collapsed) and g == currentTab
+			end
+		end
+	end
+	W.picker.Visible = (not collapsed) and currentTab == "emote" and pickerFor ~= nil
+	W.tabEmoteBtn.BackgroundColor3 = currentTab == "emote" and C.ON or C.PANEL
+	W.tabCosBtn.BackgroundColor3 = currentTab == "cos" and C.ON or C.PANEL
+end
+
+W.tabEmoteBtn.MouseButton1Click:Connect(function()
+	currentTab = "emote"
+	F.applyTabs()
+end)
+W.tabCosBtn.MouseButton1Click:Connect(function()
+	currentTab = "cos"
+	F.applyTabs()
+end)
+W.hideBtn.MouseButton1Click:Connect(function()
+	collapsed = not collapsed
+	W.hideBtn.Text = collapsed and "+" or "_"
+	F.applyTabs()
+end)
+
+local dragging, dragStart, startPos
+local function isPointer(t)
+	return t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch
+end
+W.header.InputBegan:Connect(function(input)
+	if isPointer(input.UserInputType) then
+		dragging = true
+		dragStart = input.Position
+		startPos = main.Position
+	end
+end)
+W.header.InputEnded:Connect(function(input)
+	if isPointer(input.UserInputType) then
+		dragging = false
+	end
+end)
+UserInputService.InputChanged:Connect(function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		local d = input.Position - dragStart
+		main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+	end
+end)
+
+----------------------------------------------------------------------
+-- Сохранение и загрузка
+----------------------------------------------------------------------
+function F.saveData()
+	if not writefile then
+		return
+	end
+	local nl = {}
+	for id in pairs(noise) do
+		table.insert(nl, id)
+	end
+	pcall(function()
+		writefile(SAVE_FILE, HttpService:JSONEncode({
+			sig = sigDB,
+			noise = nl,
+			source = src and src.id or nil,
+			target = tgt and tgt.id or nil,
+			variant = variant,
+			propOff = propOff,
+			worn = worn,
+			cosOn = cosOn,
+			hideOwn = hideOwn,
+		}))
+	end)
+end
+
+function F.loadData()
+	for k, l in pairs(BAKED.sig) do
+		sigDB[k] = l
+	end
+	for _, id in ipairs(BAKED.noise) do
+		noise[tostring(id)] = true
+	end
+	if not (isfile and readfile) then
+		return nil
+	end
+	local ok, raw = pcall(function()
+		if isfile(SAVE_FILE) then
+			return readfile(SAVE_FILE)
+		end
+		return nil
+	end)
+	if not ok or not raw then
+		return nil
+	end
+	local ok2, data = pcall(function()
+		return HttpService:JSONDecode(raw)
+	end)
+	if not ok2 or type(data) ~= "table" then
+		return nil
+	end
+	if type(data.sig) == "table" then
+		for k, l in pairs(data.sig) do
+			sigDB[k] = l
+		end
+	end
+	if type(data.noise) == "table" then
+		for _, id in ipairs(data.noise) do
+			noise[tostring(id)] = true
+		end
+	end
+	if type(data.propOff) == "table" then
+		for k, o in pairs(data.propOff) do
+			if type(o) == "table" then
+				propOff[k] = { x = tonumber(o.x) or 0, y = tonumber(o.y) or 0, z = tonumber(o.z) or 0, r = tonumber(o.r) or 0 }
+			end
+		end
+	end
+	return data
+end
+
+----------------------------------------------------------------------
+-- Список эмоций
+----------------------------------------------------------------------
+function F.groupOf(folder)
+	local names = {}
+	local cur = folder.Parent
+	while cur and cur ~= ReplicatedStorage and cur.Name ~= "Items" do
+		table.insert(names, 1, cur.Name)
+		cur = cur.Parent
+	end
+	local g = table.concat(names, "/")
+	g = (g:gsub("^ItemPacks/", ""))
+	if g == "BaseItems" then
+		return "магазин"
+	end
+	if g == "" then
+		return "?"
+	end
+	return g
+end
+
+local SKIP_FOLDERS = {
+	Nametags = true, Skins = true, Boomboxes = true, Boosters = true,
+	Collectables = true, CarryAnimations = true, Perks = true, Loadout = true,
+}
+
+function F.addEmote(d)
+	if not d:FindFirstChildWhichIsA("Animation", true) then
+		return
+	end
+	local full = d:GetFullName()
+	local short = (full:gsub("^ReplicatedStorage%.", ""))
+	if byId[short] then
+		return
+	end
+	local e = {
+		id = short,
+		name = d.Name,
+		pretty = prettyName(d.Name),
+		key = norm(d.Name),
+		mod = d,
+		group = F.groupOf(d.Parent),
+	}
+	table.insert(emotes, e)
+	byId[short] = e
+end
+
+function F.scanEmotes()
+	emotes, byId = {}, {}
+	local visited = 0
+	local function walk(folder, depth)
+		if depth > 8 then
+			return
+		end
+		visited = visited + 1
+		if visited % 25 == 0 then
+			task.wait()
+		end
+		for _, c in ipairs(folder:GetChildren()) do
+			if c:IsA("Folder") then
+				if c.Name == "Emotes" then
+					for _, m in ipairs(c:GetChildren()) do
+						if m:IsA("ModuleScript") then
+							F.addEmote(m)
+						end
+					end
+				elseif c.Name ~= "Cosmetics" and c.Name ~= "CharacterEffects" and not SKIP_FOLDERS[c.Name] then
+					walk(c, depth + 1)
+				end
+			end
+		end
+	end
+	local items = ReplicatedStorage:FindFirstChild("Items")
+	walk(items or ReplicatedStorage, 0)
+	table.sort(emotes, function(x, y)
+		local gx = x.group == "магазин" and 0 or 1
+		local gy = y.group == "магазин" and 0 or 1
+		if gx ~= gy then
+			return gx < gy
+		end
+		if x.group ~= y.group then
+			return x.group < y.group
+		end
+		return x.name < y.name
+	end)
+end
+
+function F.findByKey(key, preferShop)
+	local best = nil
+	for _, e in ipairs(emotes) do
+		if e.key == key then
+			if not best or (preferShop and e.group == "магазин") then
+				best = e
+			end
+		end
+	end
+	return best
+end
+
+----------------------------------------------------------------------
+-- Список косметики / персонажей / эффектов
+----------------------------------------------------------------------
+local CAT_NAMES = { cosmetic = "Косметика", character = "Персонаж", unusual = "Эффект" }
+local FX_CLASSES = { "ParticleEmitter", "Beam", "Trail", "Fire", "Smoke", "Sparkles" }
+
+function F.classify(m, below)
+	local low = {}
+	for _, n in ipairs(below) do
+		table.insert(low, n:lower())
+	end
+	for _, n in ipairs(low) do
+		if n:find("^unusual") or n:find("aura", 1, true) or n:find("effect", 1, true) then
+			return "unusual"
+		end
+	end
+	if m.Name:lower():find("aura", 1, true) then
+		return "unusual"
+	end
+	if low[1] == "character" then
+		return "character"
+	end
+	if low[1] == "normal" then
+		return "cosmetic"
+	end
+	-- по содержимому: только частицы без видимых деталей = эффект
+	local root = m:FindFirstChild("Character") or m:FindFirstChild("CharacterClassic")
+	if root then
+		local fx, vis = false, false
+		for _, d in ipairs(root:GetDescendants()) do
+			for _, cn in ipairs(FX_CLASSES) do
+				if d:IsA(cn) then
+					fx = true
+				end
+			end
+			if d:IsA("Accessory") or (d:IsA("BasePart") and not BODY[d.Name]) then
+				vis = true
+			end
+		end
+		if fx and not vis then
+			return "unusual"
+		end
+	end
+	return "cosmetic"
+end
+
+function F.scanCosmetics()
+	cosItems, cosById = {}, {}
+	local items = ReplicatedStorage:FindFirstChild("Items")
+	if not items then
+		return
+	end
+	local visited = 0
+	local function addCos(m, path, below)
+		local cat = F.classify(m, below)
+		local hasChar = m:FindFirstChild("Character") or m:FindFirstChild("CharacterClassic")
+		local hasFx = false
+		if not hasChar and cat == "unusual" then
+			hasFx = m:FindFirstChildWhichIsA("ParticleEmitter", true) ~= nil or m:FindFirstChildWhichIsA("BasePart", true) ~= nil
+		end
+		if not (hasChar or hasFx) then
+			return
+		end
+		local gp = {}
+		for _, n in ipairs(path) do
+			if n ~= "ItemPacks" and n ~= "BaseItems" then
+				table.insert(gp, n)
+			end
+		end
+		local g = table.concat(gp, "/")
+		if g == "" then
+			g = "база"
+		end
+		local sub = table.concat(below, "/")
+		local short = (m:GetFullName():gsub("^ReplicatedStorage%.", ""))
+		local e = {
+			id = short,
+			name = m.Name,
+			pretty = prettyName(m.Name),
+			mod = m,
+			group = g .. (sub ~= "" and (" / " .. sub) or ""),
+			cat = cat,
+		}
+		e.search = norm(m.Name) .. norm(e.group)
+		table.insert(cosItems, e)
+		cosById[short] = e
+	end
+	local function collect(folder, path, below)
+		visited = visited + 1
+		if visited % 25 == 0 then
+			task.wait()
+		end
+		for _, c in ipairs(folder:GetChildren()) do
+			if c:IsA("Folder") then
+				local nb = {}
+				for _, n in ipairs(below) do
+					table.insert(nb, n)
+				end
+				table.insert(nb, c.Name)
+				collect(c, path, nb)
+			elseif c:IsA("ModuleScript") then
+				addCos(c, path, below)
+			end
+		end
+	end
+	local function walk(folder, path, depth)
+		if depth > 8 then
+			return
+		end
+		visited = visited + 1
+		if visited % 25 == 0 then
+			task.wait()
+		end
+		for _, c in ipairs(folder:GetChildren()) do
+			if c:IsA("Folder") then
+				if c.Name == "Cosmetics" then
+					collect(c, path, {})
+				elseif c.Name == "CharacterEffects" then
+					collect(c, path, { "CharacterEffects" })
+				elseif c.Name ~= "Emotes" and not SKIP_FOLDERS[c.Name] then
+					local np = {}
+					for _, n in ipairs(path) do
+						table.insert(np, n)
+					end
+					table.insert(np, c.Name)
+					walk(c, np, depth + 1)
+				end
+			end
+		end
+	end
+	walk(items, {}, 0)
+	table.sort(cosItems, function(a, b)
+		if a.group ~= b.group then
+			return a.group < b.group
+		end
+		return a.name < b.name
+	end)
+end
+
+----------------------------------------------------------------------
+-- Анимации эмоций
+----------------------------------------------------------------------
+local animCache = setmetatable({}, { __mode = "k" })
+function F.collectAnims(mod)
+	if mod and animCache[mod] then
+		return animCache[mod]
+	end
+	local out = {}
+	if not mod then
+		return out
+	end
+	for _, a in ipairs(mod:GetDescendants()) do
+		if a:IsA("Animation") and numId(a.AnimationId) then
+			local names = relNames(a, mod) or {}
+			local p = table.concat(names, "/"):lower()
+			if not p:find("intro", 1, true) and not p:find("outro", 1, true) then
+				local key
+				if p:find("classic", 1, true) then
+					key = "classic"
+				elseif p:find("r6", 1, true) then
+					key = "r6"
+				else
+					key = "r15"
+				end
+				if not out[key] then
+					out[key] = numId(a.AnimationId)
+				end
+			end
+		end
+	end
+	animCache[mod] = out
+	return out
+end
+
+-- список { id =, key = } в порядке приоритета
+function F.candidates(entry, r15rig)
+	local c = F.collectAnims(entry.mod)
+	local order
+	if variant == "r6" then
+		order = { "r6" }
+	elseif variant == "classic" then
+		order = { "classic" }
+	elseif variant == "r15" then
+		order = { "r15" }
+	elseif r15rig then
+		order = { "r15", "r6", "classic" }
+	else
+		order = { "r6", "classic", "r15" }
+	end
+	local out, seen = {}, {}
+	for _, k in ipairs(order) do
+		local id = c[k]
+		if id and not seen[id] then
+			seen[id] = true
+			table.insert(out, { id = id, key = k })
+		end
+	end
+	if #out == 0 and entry.key == "broom" then
+		table.insert(out, {
+			id = numId(r15rig and FALLBACK_BROOM.r15 or FALLBACK_BROOM.r6),
+			key = r15rig and "r15" or "r6",
+		})
+	end
+	return out
+end
+
+function F.moduleIds(entry, r15rig)
+	local c = F.collectAnims(entry.mod)
+	local ids = {}
+	local order = r15rig and { "r15", "r6" } or { "r6", "classic" }
+	for _, k in ipairs(order) do
+		if c[k] then
+			table.insert(ids, c[k])
+		end
+	end
+	if #ids == 0 then
+		for _, k in pairs(c) do
+			table.insert(ids, k)
+		end
+	end
+	return ids
+end
+
+function F.refreshOwn()
+	ownIds = {}
+	if tgt then
+		for _, id in pairs(F.collectAnims(tgt.mod)) do
+			ownIds[id] = true
+		end
+		if tgt.key == "broom" then
+			ownIds[numId(FALLBACK_BROOM.r6)] = true
+			ownIds[numId(FALLBACK_BROOM.r15)] = true
+		end
+	end
+end
+
+-- звук эмоции: таблица -> Sound внутри модуля -> EmoteInfo.Sound через require
+function F.getSound(entry)
+	if not entry then
+		return nil
+	end
+	if entry.sound ~= nil then
+		return entry.sound or nil
+	end
+	local info = nil
+	local manual = SOUND_IDS[entry.key]
+	if manual then
+		info = { id = numId(manual) }
+	end
+	if not info then
+		local sObj = entry.mod:FindFirstChild("Sound", true)
+		if not (sObj and sObj:IsA("Sound")) then
+			sObj = entry.mod:FindFirstChildWhichIsA("Sound", true)
+		end
+		if sObj and numId(sObj.SoundId) then
+			info = { id = numId(sObj.SoundId), looped = sObj.Looped, volume = sObj.Volume }
+		end
+	end
+	if not info and USE_REQUIRE then
+		local ok, data = pcall(require, entry.mod)
+		if ok and type(data) == "table" and type(data.EmoteInfo) == "table" and data.EmoteInfo.Sound then
+			local id = numId(data.EmoteInfo.Sound)
+			if id then
+				info = { id = id }
+			end
+		end
+	end
+	entry.sound = info or false
+	return info
+end
+
+----------------------------------------------------------------------
+-- Риги и аниматоры
+----------------------------------------------------------------------
+function F.getRigs()
+	local out = {}
+	local rigs = workspace:FindFirstChild("Rigs")
+	if rigs then
+		for _, r in ipairs(rigs:GetChildren()) do
+			if r.Name == LocalPlayer.Name and r:IsA("Model") and r:FindFirstChildOfClass("Humanoid") then
+				table.insert(out, r)
+			end
+		end
+	end
+	return out
+end
+
+function F.refreshAnimators()
+	rigsNow = F.getRigs()
+	animList = {}
+	for _, r in ipairs(rigsNow) do
+		local a = r:FindFirstChildWhichIsA("Animator", true)
+		if a then
+			table.insert(animList, a)
+		end
+	end
+	if #animList == 0 and LocalPlayer.Character then
+		local a = LocalPlayer.Character:FindFirstChildWhichIsA("Animator", true)
+		if a then
+			table.insert(animList, a)
+		end
+	end
+end
+
+-- act[id] = ранг приоритета активных треков, wmap[id] = текущий вес
+function F.sample()
+	local act, wmap = {}, {}
+	for _, a in ipairs(animList) do
+		if a.Parent then
+			for _, t in ipairs(a:GetPlayingAnimationTracks()) do
+				local anim = t.Animation
+				local n = anim and numId(anim.AnimationId)
+				if n then
+					local w = t.WeightCurrent
+					if (wmap[n] or -1) < w then
+						wmap[n] = w
+					end
+					if t.WeightTarget > 0.02 then
+						local rk = RANK[t.Priority.Name] or 0
+						if (act[n] or -1) < rk then
+							act[n] = rk
+						end
+					end
+				end
+			end
+		end
+	end
+	return act, wmap
+end
+
+----------------------------------------------------------------------
+-- Сигнатура исходной эмоции
+----------------------------------------------------------------------
+function F.buildSig()
+	sigDirty = false
+	sigCache = nil
+	if not src then
+		return
+	end
+	local calib = sigDB[src.id]
+	local mode, ids = "all", nil
+	if calib and #calib > 0 then
+		ids = calib
+	else
+		mode = "any"
+		ids = F.moduleIds(src, #rigsNow > 0 and isR15(rigsNow[1]))
+	end
+	local set, count = {}, 0
+	for _, id in ipairs(ids) do
+		id = tostring(id)
+		if not noise[id] then
+			set[id] = true
+			count = count + 1
+		end
+	end
+	sigCache = { set = set, count = count, mode = mode, calibrated = (calib ~= nil and #calib > 0) }
+end
+
+function F.sigState(act, wmap)
+	if sigDirty then
+		F.buildSig()
+	end
+	local S = sigCache
+	if not S or S.count == 0 then
+		return false, false, 0
+	end
+	local anyP, allP, mw = false, true, 0
+	for id in pairs(S.set) do
+		if act[id] then
+			anyP = true
+		else
+			allP = false
+		end
+		local w = wmap[id]
+		if w and w > mw then
+			mw = w
+		end
+	end
+	local startOK = (S.mode == "all") and allP or anyP
+	return startOK, anyP, mw
+end
+
+----------------------------------------------------------------------
+-- Звук
+----------------------------------------------------------------------
+function F.restoreSound()
+	duckReady = false
+	for _, c in ipairs(duckConns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	duckConns = {}
+	for s, vol in pairs(ducked) do
+		pcall(function()
+			if s and s.Parent then
+				s.Volume = vol
+			end
+		end)
+	end
+	ducked = {}
+	if localSound then
+		pcall(function()
+			localSound:Stop()
+			localSound:Destroy()
+		end)
+		localSound = nil
+	end
+end
+
+function F.duckSound(d)
+	local si = F.getSound(src)
+	if not duckReady or not si then
+		return
+	end
+	if d:IsA("Sound") and numId(d.SoundId) == si.id then
+		if ducked[d] == nil then
+			ducked[d] = d.Volume
+			table.insert(duckConns, d:GetPropertyChangedSignal("Volume"):Connect(function()
+				if duckReady and soundOn and d.Volume ~= 0 then
+					d.Volume = 0
+				end
+			end))
+		end
+		d.Volume = 0
+	end
+end
+
+function F.startDucking()
+	if not soundOn or not F.getSound(src) then
+		return
+	end
+	duckReady = true
+	local roots = { SoundService }
+	if LocalPlayer.Character then
+		table.insert(roots, LocalPlayer.Character)
+	end
+	for _, r in ipairs(rigsNow) do
+		table.insert(roots, r)
+	end
+	local rigsFolder = workspace:FindFirstChild("Rigs")
+	if rigsFolder then
+		table.insert(roots, rigsFolder)
+	end
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	if pg then
+		table.insert(roots, pg)
+	end
+	for _, root in ipairs(roots) do
+		table.insert(duckConns, root.DescendantAdded:Connect(function(d)
+			pcall(F.duckSound, d)
+		end))
+	end
+	task.spawn(function()
+		local n = 0
+		for _, root in ipairs(roots) do
+			for _, d in ipairs(root:GetDescendants()) do
+				if not duckReady then
+					return
+				end
+				pcall(F.duckSound, d)
+				n = n + 1
+				if n % 300 == 0 then
+					task.wait()
+				end
+			end
+		end
+	end)
+end
+
+function F.playLocalSound(part)
+	local si = F.getSound(tgt)
+	if not soundOn or not si or not part then
+		return
+	end
+	if localSound and localSound.Parent then
+		if not localSound.IsPlaying then
+			localSound:Play()
+		end
+		return
+	end
+	local s = Instance.new("Sound")
+	s.Name = "LocalSwapAudio"
+	s.SoundId = asset(si.id)
+	localBase = (si.volume and si.volume > 0) and si.volume or 1
+	s.Volume = localBase
+	s.Looped = (si.looped == nil) and true or si.looped
+	s.Parent = part
+	s:Play()
+	localSound = s
+end
+
+----------------------------------------------------------------------
+-- Реквизит эмоций
+----------------------------------------------------------------------
+function F.attachProp(e, rig, key, silent)
+	if not e or not rig then
+		return nil
+	end
+	local preferC
+	if key == "r15" then
+		preferC = true
+	elseif key then
+		preferC = false
+	else
+		preferC = isR15(rig)
+	end
+	local h = F.graftBest(e.mod, rig, preferC, "LocalEmoteProp", {
+		parent = propInFolder and getFolder() or rig,
+		pickName = "EmoteModel",
+		animated = true,
+		fbCF = CFrame.new(0, 0, -1.2),
+	})
+	if h then
+		F.applyOffset(h, propOff[e.id])
+		if not silent then
+			log("реквизит: креплений " .. h.exact .. ", частей " .. h.parts)
+			for _, n in ipairs(h.notes) do
+				log("  " .. n)
+			end
+		end
+	elseif not silent then
+		log("реквизита у этой эмоции нет (или не найден). Нажми \"Дамп\", если он должен быть")
+	end
+	return h
+end
+
+function F.hideGameProp(em)
+	for _, p in ipairs(em:GetDescendants()) do
+		if p:IsA("BasePart") then
+			p.LocalTransparencyModifier = 1
+			hiddenProps[p] = true
+		end
+	end
+end
+
+-- дамп структуры эмоции (для отладки)
+function F.dumpModule(mod)
+	local lines = {}
+	local function add(s)
+		if #lines < 500 then
+			table.insert(lines, s)
+		end
+	end
+	local function walk(inst, depth)
+		if depth > 7 then
+			return
+		end
+		for _, c in ipairs(inst:GetChildren()) do
+			local extra = ""
+			if c:IsA("JointInstance") then
+				extra = " [" .. tostring(c.Part0 and c.Part0:GetFullName() or "nil") .. " -> " .. tostring(c.Part1 and c.Part1.Name or "nil") .. "]"
+			elseif c:IsA("WeldConstraint") then
+				extra = " [" .. tostring(c.Part0 and c.Part0.Name or "nil") .. " -> " .. tostring(c.Part1 and c.Part1.Name or "nil") .. "]"
+			elseif c:IsA("Animation") then
+				extra = " " .. tostring(c.AnimationId)
+			elseif c:IsA("Sound") then
+				extra = " " .. tostring(c.SoundId)
+			elseif c:IsA("BasePart") then
+				extra = " size=" .. tostring(c.Size)
+			elseif c:IsA("Attachment") then
+				extra = " cf=" .. tostring(c.Position)
+			end
+			add(string.rep("  ", depth) .. c.Name .. " (" .. c.ClassName .. ")" .. extra)
+			walk(c, depth + 1)
+		end
+	end
+	add(mod:GetFullName())
+	walk(mod, 1)
+	if USE_REQUIRE then
+		local ok, data = pcall(require, mod)
+		if ok and type(data) == "table" then
+			add("require ->")
+			for k, v in pairs(data) do
+				add("  " .. tostring(k) .. " = " .. (type(v) == "table" and "{table}" or tostring(v)))
+				if type(v) == "table" then
+					for k2, v2 in pairs(v) do
+						add("    " .. tostring(k2) .. " = " .. (type(v2) == "table" and "{table}" or tostring(v2)))
+					end
+				end
+			end
+		else
+			add("require: " .. tostring(data))
+		end
+	end
+	return table.concat(lines, "\n"), #lines
+end
+
+----------------------------------------------------------------------
+-- Подмена анимации
+----------------------------------------------------------------------
+function F.makeTrack(animator, id)
+	local anim = Instance.new("Animation")
+	anim.AnimationId = asset(id)
+	local ok, track = pcall(function()
+		return animator:LoadAnimation(anim)
+	end)
+	if not ok or not track then
+		log("LoadAnimation: " .. tostring(track))
+		return nil
+	end
+	track.Priority = Enum.AnimationPriority.Action4
+	track.Looped = true
+	anim.Parent = animator.Parent
+	return track
+end
+
+function F.prewarm()
+	if not tgt or building or showing then
+		return
+	end
+	for _, a in ipairs(animList) do
+		if a.Parent then
+			local rig = a:FindFirstAncestorOfClass("Model")
+			local c = F.candidates(tgt, rig and isR15(rig))
+			local id = c[1] and c[1].id
+			local p = pre[a]
+			if id and not (p and p.id == id and p.track) then
+				local tr = F.makeTrack(a, id)
+				if tr then
+					pre[a] = { id = id, track = tr }
+				end
+			end
+		end
+	end
+end
+
+function F.loadWorking(animator, cands, token)
+	for _, cand in ipairs(cands) do
+		local id = cand.id
+		local p = pre[animator]
+		local track
+		local isPre = false
+		if p and p.id == id and p.track and p.track.Length > 0 then
+			track = p.track
+			isPre = true
+		else
+			track = F.makeTrack(animator, id)
+		end
+		if track then
+			local t0 = os.clock()
+			while track.Length <= 0 and os.clock() - t0 < 1.5 and not token.dead do
+				task.wait(0.1)
+			end
+			if track.Length > 0 then
+				return track, id, cand.key
+			end
+			log("анимация " .. tostring(id) .. " не загрузилась")
+			if not isPre then
+				pcall(function()
+					track:Destroy()
+				end)
+			end
+		end
+	end
+	return nil, nil, nil
+end
+
+function F.stopVisual()
+	if visualToken then
+		visualToken.dead = true
+		visualToken = nil
+	end
+	for _, v in ipairs(visuals) do
+		pcall(function()
+			v.track:Stop(0.1)
+			local p = pre[v.animator]
+			if not (p and p.track == v.track) then
+				v.track:Destroy()
+			end
+		end)
+		if v.prop then
+			F.destroyHandle(v.prop)
+		end
+	end
+	visuals = {}
+	for p in pairs(hiddenProps) do
+		pcall(function()
+			p.LocalTransparencyModifier = 0
+		end)
+	end
+	hiddenProps = {}
+	F.restoreSound()
+	showing = false
+	showSince = nil
+end
+
+function F.startVisual()
+	if not tgt then
+		return false
+	end
+	if #rigsNow == 0 then
+		log("не нашла твой риг в Workspace.Rigs")
+		return false
+	end
+	local token = { dead = false }
+	visualToken = token
+	local result = {}
+	local usedCand = nil
+	for _, rig in ipairs(rigsNow) do
+		local animator = rig:FindFirstChildWhichIsA("Animator", true)
+		if animator then
+			local cands = F.candidates(tgt, isR15(rig))
+			if usedCand then
+				table.insert(cands, 1, usedCand)
+			end
+			local track, id, key = F.loadWorking(animator, cands, token)
+			if token.dead then
+				return false
+			end
+			if track then
+				usedCand = usedCand or { id = id, key = key }
+				table.insert(result, { rig = rig, animator = animator, track = track, id = id, key = key })
+			end
+		end
+	end
+	if token.dead or not enabled then
+		for _, v in ipairs(result) do
+			pcall(function()
+				v.track:Stop(0)
+			end)
+		end
+		return false
+	end
+	if #result == 0 then
+		log("анимация цели не загрузилась. Попробуй кнопку \"Анимация\" (R6/Classic/R15)")
+		visualToken = nil
+		return false
+	end
+	local first = true
+	for _, v in ipairs(result) do
+		v.track.Looped = true
+		v.track:Play(0, 1, 1)
+		v.track:AdjustWeight(1, 0)
+		v.prop = F.attachProp(tgt, v.rig, v.key, not first)
+		if v.prop then
+			hasProp = true
+		elseif first then
+			hasProp = false
+		end
+		first = false
+	end
+	visuals = result
+	showing = true
+	log("подмена включена: " .. tgt.pretty .. " (ригов: " .. #result .. ", анимация " .. tostring(usedCand and usedCand.id) .. ")")
+	return true
+end
+
+----------------------------------------------------------------------
+-- Косметика / персонажи / эффекты
+----------------------------------------------------------------------
+function F.clearCosRig(rig)
+	local st = cosState[rig]
+	if st then
+		for _, h in ipairs(st.handles) do
+			F.destroyHandle(h)
+		end
+		cosState[rig] = nil
+	end
+end
+
+function F.restoreHidden()
+	for p in pairs(hiddenCos) do
+		pcall(function()
+			p.LocalTransparencyModifier = 0
+		end)
+	end
+	hiddenCos = {}
+	hideMode = ""
+end
+
+function F.clearCos()
+	for rig in pairs(cosState) do
+		F.clearCosRig(rig)
+	end
+	F.restoreHidden()
+end
+
+function F.wornEntries()
+	local out = {}
+	if worn.character and cosById[worn.character] then
+		table.insert(out, { e = cosById[worn.character], kind = "character" })
+	end
+	for _, id in ipairs(worn.cosmetic) do
+		if cosById[id] then
+			table.insert(out, { e = cosById[id], kind = "cosmetic" })
+		end
+	end
+	if worn.unusual and cosById[worn.unusual] then
+		table.insert(out, { e = cosById[worn.unusual], kind = "unusual" })
+	end
+	return out
+end
+
+function F.applyCos(e, rig, kind)
+	local h = F.graftBest(e.mod, rig, isR15(rig), "LocalCos_" .. e.name, {
+		parent = getFolder(),
+		skin = (kind == "character"),
+		allowSelf = (kind == "unusual"),
+		fbCF = CFrame.new(),
+	})
+	if not h then
+		log("не удалось надеть: " .. e.pretty)
+	else
+		log("надето: " .. e.pretty .. " (креплений " .. h.exact .. ", частей " .. h.parts .. ")")
+		for i, n in ipairs(h.notes) do
+			if i <= 4 then
+				log("  " .. n)
+			end
+		end
+	end
+	return h
+end
+
+function F.hideOwnStuff(rig, hideAcc, hideBody)
+	local mode = (hideAcc and "a" or "") .. (hideBody and "b" or "")
+	if mode ~= hideMode then
+		F.restoreHidden()
+		hideMode = mode
+	end
+	for _, p in ipairs(rig:GetDescendants()) do
+		if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" and not hiddenCos[p] then
+			if not F.isOur(p) and p.Name ~= "EmoteModel" and not p:FindFirstAncestor("EmoteModel") then
+				local isBody = BODY[p.Name] ~= nil
+				if (isBody and hideBody) or ((not isBody) and hideAcc) then
+					p.LocalTransparencyModifier = 1
+					hiddenCos[p] = true
+				end
+			end
+		end
+	end
+end
+
+function F.cosTick()
+	local rigs = F.getRigs()
+	local alive = {}
+	for _, r in ipairs(rigs) do
+		alive[r] = true
+	end
+	for rig in pairs(cosState) do
+		if not alive[rig] or not rig.Parent or not cosOn then
+			F.clearCosRig(rig)
+		end
+	end
+	if not cosOn then
+		F.restoreHidden()
+		return
+	end
+	local entries = F.wornEntries()
+	local parts = {}
+	for _, w in ipairs(entries) do
+		table.insert(parts, w.kind .. ":" .. w.e.id)
+	end
+	local sig = table.concat(parts, "|")
+	for _, rig in ipairs(rigs) do
+		local st = cosState[rig]
+		local ok = st ~= nil and st.sig == sig
+		if ok then
+			for _, h in ipairs(st.handles) do
+				if not h.container.Parent or (h.firstJoint and not h.firstJoint.Parent) then
+					ok = false
+					break
+				end
+			end
+		end
+		if not ok then
+			F.clearCosRig(rig)
+			local handles = {}
+			for _, w in ipairs(entries) do
+				local okc, h = pcall(F.applyCos, w.e, rig, w.kind)
+				if okc and h then
+					table.insert(handles, h)
+				elseif not okc then
+					log("ошибка косметики: " .. tostring(h))
+				end
+			end
+			cosState[rig] = { sig = sig, handles = handles }
+		end
+		local skin = worn.character ~= nil and cosById[worn.character] ~= nil
+		if hideOwn or skin then
+			F.hideOwnStuff(rig, hideOwn, skin)
+		end
+	end
+	if not hideOwn and not (worn.character and cosById[worn.character]) then
+		F.restoreHidden()
+	end
+end
+
+---------------- список в UI ----------------
+local cosBtns = {}
+local cosToken = 0
+
+function F.isWorn(e)
+	if e.cat == "cosmetic" then
+		return indexOf(worn.cosmetic, e.id) ~= nil
+	end
+	return worn[e.cat] == e.id
+end
+
+function F.updateWornLabel()
+	local function nameOf(id)
+		local e = cosById[id]
+		return e and e.pretty or id
+	end
+	local cn = {}
+	for _, id in ipairs(worn.cosmetic) do
+		table.insert(cn, nameOf(id))
+	end
+	W.cosWornLabel.Text = "Косметика (" .. #cn .. "/3): " .. (#cn > 0 and table.concat(cn, ", ") or "-")
+		.. "\nПерсонаж: " .. (worn.character and nameOf(worn.character) or "-")
+		.. "\nЭффект: " .. (worn.unusual and nameOf(worn.unusual) or "-")
+end
+
+function F.repaintCos()
+	for _, r in ipairs(cosBtns) do
+		local w = F.isWorn(r.it)
+		r.b.Text = (w and "[x] " or "[  ] ") .. r.it.pretty .. "  -  " .. r.it.group
+		r.b.BackgroundColor3 = w and Color3.fromRGB(38, 70, 52) or C.PANEL
+	end
+end
+
+function F.toggleWear(e)
+	if e.cat == "cosmetic" then
+		local idx = indexOf(worn.cosmetic, e.id)
+		if idx then
+			table.remove(worn.cosmetic, idx)
+		else
+			table.insert(worn.cosmetic, e.id)
+			if #worn.cosmetic > 3 then
+				table.remove(worn.cosmetic, 1)
+			end
+		end
+	else
+		if worn[e.cat] == e.id then
+			worn[e.cat] = nil
+		else
+			worn[e.cat] = e.id
+		end
+	end
+	F.repaintCos()
+	F.updateWornLabel()
+	F.saveData()
+end
+
+function F.refreshCosList()
+	for _, r in ipairs(cosBtns) do
+		r.b:Destroy()
+	end
+	cosBtns = {}
+	local q = norm(W.cosSearch.Text)
+	local shown, total = 0, 0
+	for _, it in ipairs(cosItems) do
+		if it.cat == cosCat and (q == "" or it.search:find(q, 1, true)) then
+			total = total + 1
+			if shown < 80 then
+				shown = shown + 1
+				local b = Instance.new("TextButton")
+				b.Size = UDim2.new(1, -6, 0, 26)
+				b.BackgroundColor3 = C.PANEL
+				b.TextXAlignment = Enum.TextXAlignment.Left
+				b.TextTruncate = Enum.TextTruncate.AtEnd
+				b.Font = Enum.Font.Gotham
+				b.TextSize = 12
+				b.TextColor3 = C.TEXT
+				b.LayoutOrder = shown
+				b.Parent = W.cosList
+				corner(b, 5)
+				local bp = Instance.new("UIPadding")
+				bp.PaddingLeft = UDim.new(0, 8)
+				bp.Parent = b
+				b.MouseButton1Click:Connect(function()
+					F.toggleWear(it)
+				end)
+				table.insert(cosBtns, { b = b, it = it })
+			end
+		end
+	end
+	F.repaintCos()
+	W.cosCount.Text = CAT_NAMES[cosCat] .. ": показано " .. shown .. " из " .. total .. (total > shown and " (уточни поиск)" or "")
+end
+
+W.cosSearch:GetPropertyChangedSignal("Text"):Connect(function()
+	cosToken = cosToken + 1
+	local mine = cosToken
+	task.delay(0.25, function()
+		if mine == cosToken then
+			F.refreshCosList()
+		end
+	end)
+end)
+
+function F.setCat(c)
+	cosCat = c
+	F.paintCosToggle()
+	F.refreshCosList()
+end
+W.catCosBtn.MouseButton1Click:Connect(function()
+	F.setCat("cosmetic")
+end)
+W.catCharBtn.MouseButton1Click:Connect(function()
+	F.setCat("character")
+end)
+W.catFxBtn.MouseButton1Click:Connect(function()
+	F.setCat("unusual")
+end)
+
+W.cosToggle.MouseButton1Click:Connect(function()
+	cosOn = not cosOn
+	F.paintCosToggle()
+	F.saveData()
+	pcall(F.cosTick)
+end)
+
+W.cosClearBtn.MouseButton1Click:Connect(function()
+	worn = { cosmetic = {}, character = nil, unusual = nil }
+	F.updateWornLabel()
+	F.repaintCos()
+	F.saveData()
+	pcall(F.cosTick)
+end)
+
+W.cosHideBtn.MouseButton1Click:Connect(function()
+	hideOwn = not hideOwn
+	F.paintCosToggle()
+	F.saveData()
+	pcall(F.cosTick)
+end)
+
+----------------------------------------------------------------------
+-- Запоминание id
+----------------------------------------------------------------------
+function F.paintLearn()
+	if learn and learn.kind == "sig" then
+		W.learnBtn.Text = "Отмена"
+		W.learnBtn.BackgroundColor3 = Color3.fromRGB(110, 60, 70)
+	else
+		W.learnBtn.Text = "2. Запомнить id"
+		W.learnBtn.BackgroundColor3 = C.PANEL
+	end
+	if learn and learn.kind == "noise" then
+		W.noiseBtn.Text = "Отмена"
+		W.noiseBtn.BackgroundColor3 = Color3.fromRGB(110, 60, 70)
+	else
+		W.noiseBtn.Text = "1. Записать шум"
+		W.noiseBtn.BackgroundColor3 = C.PANEL
+	end
+end
+
+function F.updateButtons()
+	local s = src and (src.pretty .. (sigDB[src.id] and "  (id запомнены)" or "")) or "не выбрано"
+	local t = tgt and tgt.pretty or "не выбрано"
+	W.srcBtn.Text = "Что нажимаю: " .. s
+	W.tgtBtn.Text = "Что показать: " .. t
+	W.variantBtn.Text = "Анимация: " .. (variant == "auto" and "авто" or variant)
+end
+
+function F.startLearn(kind)
+	if learn then
+		learn = nil
+		F.paintLearn()
+		setStatus("Отменено.", false)
+		return
+	end
+	if kind == "sig" and not src then
+		setStatus("Сначала выбери эмоцию, которую нажимаешь.", false)
+		return
+	end
+	F.stopVisual()
+	F.refreshAnimators()
+	local act = F.sample()
+	local base = {}
+	for id, rk in pairs(act) do
+		if rk >= RANK_ACTION then
+			base[id] = true
+		end
+	end
+	learn = { kind = kind, t0 = os.clock(), base = base, seen = {}, dur = 8 }
+	F.paintLearn()
+	if kind == "noise" then
+		log("запись шума 8 сек: жми Ctrl, прыгай, включай ДРУГИЕ эмоции (не нужную)")
+	else
+		log("жду, когда ты нажмёшь \"" .. src.pretty .. "\" (стой на месте 4 сек)")
+	end
+end
+
+function F.learnSnapshot(act, L)
+	local s = {}
+	for id, rk in pairs(act) do
+		if rk >= RANK_ACTION and not L.base[id] and not noise[id] and not ownIds[id] then
+			s[id] = true
+		end
+	end
+	return s
+end
+
+function F.handleLearn(now)
+	local L = learn
+	local act = F.sample()
+	if L.kind == "noise" then
+		for id, rk in pairs(act) do
+			if rk >= RANK_ACTION and not L.base[id] and not ownIds[id] then
+				L.seen[id] = true
+			end
+		end
+		local left = L.t0 + L.dur - now
+		if left > 0 then
+			setStatus("Шум: ещё " .. math.ceil(left) .. " сек. Ctrl, прыжки, другие эмоции.", true)
+			return
+		end
+		local l = {}
+		for id in pairs(L.seen) do
+			noise[id] = true
+			table.insert(l, id)
+		end
+		table.sort(l)
+		learn = nil
+		F.paintLearn()
+		sigDirty = true
+		F.saveData()
+		log("шум записан: " .. (#l > 0 and table.concat(l, ", ") or "ничего нового"))
+		setStatus("Шум записан. Теперь \"2. Запомнить id\".", true)
+		return
+	end
+
+	if not L.trigger then
+		for id, rk in pairs(act) do
+			if rk >= RANK_ACTION and not L.base[id] and not noise[id] and not ownIds[id] then
+				L.trigger = now
+				break
+			end
+		end
+		if not L.trigger then
+			if now - L.t0 > 25 then
+				learn = nil
+				F.paintLearn()
+				log("не увидела эмоцию за 25 сек. Попробуй ещё раз")
+				setStatus("Не увидела эмоцию.", false)
+			else
+				setStatus("Нажми \"" .. src.pretty .. "\" в колесе и стой на месте.", true)
+			end
+		end
+		return
+	end
+
+	local dt = now - L.trigger
+	if dt >= 1.5 and not L.s1 then
+		L.s1 = F.learnSnapshot(act, L)
+	end
+	if dt >= 3.0 and L.s1 then
+		local s2 = F.learnSnapshot(act, L)
+		local res = {}
+		for id in pairs(L.s1) do
+			if s2[id] then
+				table.insert(res, id)
+			end
+		end
+		table.sort(res)
+		learn = nil
+		F.paintLearn()
+		if #res == 0 then
+			log("не получилось: нет устойчивых id. Стой на месте и держи эмоцию 4 сек")
+			setStatus("Не получилось. Попробуй ещё раз.", false)
+		else
+			sigDB[src.id] = res
+			sigDirty = true
+			F.saveData()
+			F.updateButtons()
+			log("запомнила для " .. src.pretty .. ": " .. table.concat(res, ", "))
+			setStatus("id запомнены. Можно включать подмену.", true)
+		end
+	elseif dt > 10 then
+		learn = nil
+		F.paintLearn()
+		log("эмоция закончилась слишком быстро")
+		setStatus("Не получилось. Держи эмоцию 4 сек.", false)
+	end
+end
+
+----------------------------------------------------------------------
+-- Главный цикл
+----------------------------------------------------------------------
+function F.onStep()
+	local now = os.clock()
+
+	if now - lastCos > 0.5 then
+		lastCos = now
+		local ok, err = pcall(F.cosTick)
+		if not ok and tostring(err) ~= lastErr then
+			lastErr = tostring(err)
+			log("ошибка косметики: " .. lastErr)
+		end
+	end
+
+	if now - lastRefresh > 1.0 and not showing then
+		lastRefresh = now
+		pcall(F.refreshAnimators)
+		if enabled and not building and not learn then
+			task.spawn(function()
+				pcall(F.prewarm)
+			end)
+		end
+	end
+
+	if learn then
+		pcall(F.handleLearn, now)
+		return
+	end
+
+	if not enabled then
+		if showing then
+			F.stopVisual()
+		end
+		return
+	end
+
+	local act, wmap = F.sample()
+	local startOK, holdOK, mw
+	if force then
+		startOK, holdOK, mw = true, true, 1
+	else
+		startOK, holdOK, mw = F.sigState(act, wmap)
+	end
+
+	if not showing then
+		if startOK and not building and now >= nextTry then
+			building = true
+			task.spawn(function()
+				local ok, res = pcall(F.startVisual)
+				if not ok then
+					log("ошибка: " .. tostring(res))
+					nextTry = os.clock() + 2
+				elseif not res then
+					nextTry = os.clock() + 2
+				end
+				building = false
+			end)
+		end
+		return
+	end
+
+	if not showSince then
+		showSince = now
+	end
+	local holding = holdOK or mw > 0.03
+	for _, v in ipairs(visuals) do
+		if not v.rig.Parent then
+			holding = false
+		end
+	end
+	if not holding then
+		F.stopVisual()
+		setStatus("Включено. Жду \"" .. (src and src.pretty or "эмоцию") .. "\".", true)
+		return
+	end
+
+	-- сторож реквизита и скрытие реквизита исходной эмоции
+	if now - lastProp > 0.4 then
+		lastProp = now
+		for _, v in ipairs(visuals) do
+			local p = v.prop
+			local broken = hasProp and tgt ~= nil
+				and ((not p) or (not p.container.Parent) or (p.firstJoint ~= nil and not p.firstJoint.Parent))
+			if broken then
+				if p then
+					F.destroyHandle(p)
+				end
+				propFails = propFails + 1
+				if propFails >= 4 and not propInFolder then
+					propInFolder = true
+					log("игра удаляет реквизит из рига, переношу его в отдельную папку")
+				end
+				v.prop = F.attachProp(tgt, v.rig, v.key, true)
+			end
+			local em = v.rig:FindFirstChild("EmoteModel")
+			if em then
+				F.hideGameProp(em)
+			end
+		end
+	end
+
+	-- вес подмены: в начале полный, потом повторяет вес исходной эмоции
+	local bw
+	if force or (showSince and now - showSince < 0.6) then
+		bw = 1
+	elseif mw > 0.03 then
+		bw = math.clamp(mw * 1.5, 0, 1)
+	else
+		bw = holdOK and 1 or 0
+	end
+	for _, v in ipairs(visuals) do
+		if holdOK and not v.track.IsPlaying then
+			pcall(function()
+				v.track.Looped = true
+				v.track:Play(0, 1, 1)
+			end)
+		end
+		pcall(function()
+			v.track:AdjustWeight(bw, 0)
+		end)
+	end
+
+	if soundOn then
+		if not duckReady then
+			F.startDucking()
+		end
+		local root = visuals[1] and findRoot(visuals[1].rig)
+		F.playLocalSound(root)
+		if localSound then
+			pcall(function()
+				localSound.Volume = localBase * bw
+			end)
+		end
+	else
+		F.restoreSound()
+	end
+end
+
+RunService:BindToRenderStep("EmoteSwapStep", Enum.RenderPriority.Camera.Value + 1, function()
+	local ok, err = pcall(F.onStep)
+	if not ok and tostring(err) ~= lastErr then
+		lastErr = tostring(err)
+		log("ошибка в цикле: " .. lastErr)
+	end
+end)
+
+----------------------------------------------------------------------
+-- Выбор эмоций
+----------------------------------------------------------------------
+local itemBtns = {}
+
+function F.filterList()
+	local q = norm(W.searchBox.Text)
+	for _, it in ipairs(itemBtns) do
+		it.btn.Visible = (q == "") or (it.key:find(q, 1, true) ~= nil)
+	end
+end
+
+function F.buildList()
+	for _, it in ipairs(itemBtns) do
+		it.btn:Destroy()
+	end
+	itemBtns = {}
+	for i, e in ipairs(emotes) do
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(1, -6, 0, 26)
+		b.BackgroundColor3 = C.PANEL
+		b.Text = e.pretty .. "   -   " .. e.group
+		b.TextXAlignment = Enum.TextXAlignment.Left
+		b.Font = Enum.Font.Gotham
+		b.TextSize = 12
+		b.TextColor3 = C.TEXT
+		b.LayoutOrder = i
+		b.Parent = W.listFrame
+		corner(b, 5)
+		local bp = Instance.new("UIPadding")
+		bp.PaddingLeft = UDim.new(0, 8)
+		bp.Parent = b
+		b.MouseButton1Click:Connect(function()
+			F.chooseEmote(e)
+		end)
+		itemBtns[i] = { btn = b, key = e.key .. norm(e.group) }
+		if i % 60 == 0 then
+			task.wait()
+		end
+	end
+	F.filterList()
+end
+
+W.searchBox:GetPropertyChangedSignal("Text"):Connect(F.filterList)
+
+function F.openPicker(which)
+	if pickerFor == which then
+		pickerFor = nil
+		F.applyTabs()
+		return
+	end
+	pickerFor = which
+	W.searchBox.Text = ""
+	F.filterList()
+	F.applyTabs()
+end
+
+W.srcBtn.MouseButton1Click:Connect(function()
+	F.openPicker("source")
+end)
+W.tgtBtn.MouseButton1Click:Connect(function()
+	F.openPicker("target")
+end)
+
+F.chooseEmote = function(e)
+	local which = pickerFor
+	if which == "source" then
+		src = e
+		sigDirty = true
+	elseif which == "target" then
+		tgt = e
+		pre = {}
+		F.refreshOwn()
+		if enabled then
+			task.spawn(function()
+				pcall(F.prewarm)
+			end)
+		end
+	end
+	pickerFor = nil
+	F.applyTabs()
+	if showing then
+		F.stopVisual()
+	end
+	F.updateButtons()
+	F.saveData()
+	log("выбрано: " .. e.pretty .. " (" .. e.group .. ")")
+	task.spawn(function()
+		local si = F.getSound(e)
+		log("звук " .. e.pretty .. ": " .. (si and si.id or "не найден"))
+	end)
+end
+
+----------------------------------------------------------------------
+-- Кнопки
+----------------------------------------------------------------------
+W.toggle.MouseButton1Click:Connect(function()
+	if enabled then
+		enabled = false
+		force = false
+		W.testBtn.Text = "Тест: ВЫКЛ"
+		F.stopVisual()
+		setStatus("Выключено.", false)
+		log("выкл")
+	else
+		if not src or not tgt then
+			setStatus("Выбери обе эмоции.", false)
+			return
+		end
+		if learn then
+			learn = nil
+			F.paintLearn()
+		end
+		F.refreshAnimators()
+		F.refreshOwn()
+		sigDirty = true
+		F.buildSig()
+		enabled = true
+		task.spawn(function()
+			pcall(F.prewarm)
+		end)
+		local S = sigCache
+		if S then
+			local ids = {}
+			for id in pairs(S.set) do
+				table.insert(ids, id)
+			end
+			table.sort(ids)
+			log("ловлю " .. src.pretty .. " (" .. (S.calibrated and "запомнено" or "по модулю, не запомнено") .. "): " .. table.concat(ids, ", "))
+			if not S.calibrated then
+				log("совет: нажми \"1. Записать шум\" и \"2. Запомнить id\", чтобы не было ложных срабатываний")
+			end
+		end
+		local ss, st = F.getSound(src), F.getSound(tgt)
+		log("звук источника: " .. (ss and ss.id or "не найден (оригинал не заглушу)") .. ", цели: " .. (st and st.id or "не найден (звука подмены не будет)"))
+		setStatus("Включено. Жми \"" .. src.pretty .. "\".", true)
+	end
+	F.paintToggle()
+end)
+
+W.soundBtn.MouseButton1Click:Connect(function()
+	soundOn = not soundOn
+	if soundOn then
+		W.soundBtn.Text = "Звук: ВКЛ"
+		W.soundBtn.BackgroundColor3 = C.ON
+	else
+		W.soundBtn.Text = "Звук: ВЫКЛ"
+		W.soundBtn.BackgroundColor3 = C.PANEL
+		F.restoreSound()
+	end
+end)
+
+W.noiseBtn.MouseButton1Click:Connect(function()
+	F.startLearn("noise")
+end)
+W.learnBtn.MouseButton1Click:Connect(function()
+	F.startLearn("sig")
+end)
+
+W.testBtn.MouseButton1Click:Connect(function()
+	if not enabled then
+		log("сначала нажми ВКЛ")
+		return
+	end
+	force = not force
+	W.testBtn.Text = force and "Тест: ВКЛ" or "Тест: ВЫКЛ"
+	log(force and "тест: показываю подмену без эмоции" or "тест выкл")
+end)
+
+W.variantBtn.MouseButton1Click:Connect(function()
+	local order = { "auto", "r6", "classic", "r15" }
+	local idx = 1
+	for i, v in ipairs(order) do
+		if v == variant then
+			idx = i
+		end
+	end
+	variant = order[(idx % #order) + 1]
+	pre = {}
+	if showing then
+		F.stopVisual()
+	end
+	F.updateButtons()
+	F.saveData()
+	log("вариант анимации: " .. variant)
+end)
+
+-- подстройка реквизита
+function F.nudge(dx, dy, dz, dr)
+	if not tgt then
+		return
+	end
+	local o = propOff[tgt.id] or { x = 0, y = 0, z = 0, r = 0 }
+	o.x, o.y, o.z, o.r = o.x + dx, o.y + dy, o.z + dz, o.r + dr
+	propOff[tgt.id] = o
+	for _, v in ipairs(visuals) do
+		if v.prop then
+			F.applyOffset(v.prop, o)
+		end
+	end
+	F.saveData()
+	log(string.format("смещение реквизита: x=%.2f y=%.2f z=%.2f поворот=%d", o.x, o.y, o.z, o.r))
+end
+local STEP = 0.25
+W.pLeft.MouseButton1Click:Connect(function()
+	F.nudge(-STEP, 0, 0, 0)
+end)
+W.pRight.MouseButton1Click:Connect(function()
+	F.nudge(STEP, 0, 0, 0)
+end)
+W.pDown.MouseButton1Click:Connect(function()
+	F.nudge(0, -STEP, 0, 0)
+end)
+W.pUp.MouseButton1Click:Connect(function()
+	F.nudge(0, STEP, 0, 0)
+end)
+W.pFwd.MouseButton1Click:Connect(function()
+	F.nudge(0, 0, -STEP, 0)
+end)
+W.pBack.MouseButton1Click:Connect(function()
+	F.nudge(0, 0, STEP, 0)
+end)
+W.pRotL.MouseButton1Click:Connect(function()
+	F.nudge(0, 0, 0, -15)
+end)
+W.pRotR.MouseButton1Click:Connect(function()
+	F.nudge(0, 0, 0, 15)
+end)
+W.pReset.MouseButton1Click:Connect(function()
+	if not tgt then
+		return
+	end
+	propOff[tgt.id] = nil
+	for _, v in ipairs(visuals) do
+		if v.prop then
+			F.applyOffset(v.prop, nil)
+		end
+	end
+	F.saveData()
+	log("смещение реквизита сброшено")
+end)
+W.pDump.MouseButton1Click:Connect(function()
+	if not tgt then
+		log("сначала выбери \"Что показать\"")
+		return
+	end
+	local ok, text, n = pcall(F.dumpModule, tgt.mod)
+	if not ok then
+		log("дамп не удался: " .. tostring(text))
+		return
+	end
+	local copied = pcall(function()
+		setclipboard(text)
+	end)
+	log("дамп структуры " .. tgt.pretty .. ": " .. tostring(n) .. " строк" .. (copied and ", скопирован в буфер" or ""))
+	local c = 0
+	for line in text:gmatch("[^\n]+") do
+		c = c + 1
+		if c > 40 then
+			break
+		end
+		log(line)
+	end
+end)
+
+W.exportBtn.MouseButton1Click:Connect(function()
+	local lines = { "BAKED = {", "\tsig = {" }
+	local keys = {}
+	for k in pairs(sigDB) do
+		table.insert(keys, k)
+	end
+	table.sort(keys)
+	for _, k in ipairs(keys) do
+		local q = {}
+		for _, id in ipairs(sigDB[k]) do
+			table.insert(q, string.format("%q", tostring(id)))
+		end
+		table.insert(lines, string.format("\t\t[%q] = { %s },", k, table.concat(q, ", ")))
+	end
+	table.insert(lines, "\t},")
+	local nl = {}
+	for id in pairs(noise) do
+		table.insert(nl, string.format("%q", id))
+	end
+	table.sort(nl)
+	table.insert(lines, "\tnoise = { " .. table.concat(nl, ", ") .. " },")
+	table.insert(lines, "}")
+	local text = table.concat(lines, "\n")
+	local ok = pcall(function()
+		setclipboard(text)
+	end)
+	log(text)
+	log(ok and "экспорт скопирован" or "setclipboard недоступен, скопируй текст из лога")
+end)
+
+W.copyBtn.MouseButton1Click:Connect(function()
+	local ok = pcall(function()
+		setclipboard(table.concat(logLines, "\n"))
+	end)
+	log(ok and "лог скопирован" or "setclipboard недоступен в этом инжекторе")
+end)
+
+local charConn = LocalPlayer.CharacterAdded:Connect(function()
+	F.stopVisual()
+	task.delay(1.5, function()
+		pcall(F.refreshAnimators)
+	end)
+end)
+
+function F.cleanup()
+	enabled = false
+	force = false
+	cosOn = false
+	learn = nil
+	pcall(function()
+		RunService:UnbindFromRenderStep("EmoteSwapStep")
+	end)
+	if charConn then
+		charConn:Disconnect()
+	end
+	F.stopVisual()
+	pcall(F.clearCos)
+	local folder = workspace:FindFirstChild("LocalBroomFolder")
+	if folder then
+		folder:Destroy()
+	end
+	if gui then
+		gui:Destroy()
+	end
+end
+
+W.closeBtn.MouseButton1Click:Connect(function()
+	F.cleanup()
+	env.EmoteSwapCleanup = nil
+end)
+env.EmoteSwapCleanup = F.cleanup
+
+----------------------------------------------------------------------
+-- Старт
+----------------------------------------------------------------------
+F.paintToggle()
+F.paintCosToggle()
+F.paintLearn()
+F.applyTabs()
+task.spawn(function()
+	local ok, err = pcall(F.scanEmotes)
+	if not ok then
+		log("ошибка поиска эмоций: " .. tostring(err))
+	end
+	local data = F.loadData()
+	local s = data and data.source and byId[data.source]
+	local t = data and data.target and byId[data.target]
+	src = s or F.findByKey("boldmarch", true)
+	tgt = t or F.findByKey("broom", false)
+	if data and data.variant then
+		variant = data.variant
+	end
+	F.refreshOwn()
+	sigDirty = true
+	F.updateButtons()
+	pcall(F.buildList)
+	log("эмоций найдено: " .. #emotes)
+	if not src or not tgt then
+		log("не нашла Bold March или Broom, выбери эмоции вручную")
+	end
+
+	local ok2, err2 = pcall(F.scanCosmetics)
+	if not ok2 then
+		log("ошибка поиска косметики: " .. tostring(err2))
+	end
+	local n = { cosmetic = 0, character = 0, unusual = 0 }
+	for _, it in ipairs(cosItems) do
+		n[it.cat] = n[it.cat] + 1
+	end
+	log("найдено: косметики " .. n.cosmetic .. ", персонажей " .. n.character .. ", эффектов " .. n.unusual)
+
+	if data and type(data.worn) == "table" then
+		if type(data.worn.cosmetic) == "table" then
+			for _, id in ipairs(data.worn.cosmetic) do
+				if cosById[id] and #worn.cosmetic < 3 then
+					table.insert(worn.cosmetic, id)
+				end
+			end
+		end
+		if data.worn.character and cosById[data.worn.character] then
+			worn.character = data.worn.character
+		end
+		if data.worn.unusual and cosById[data.worn.unusual] then
+			worn.unusual = data.worn.unusual
+		end
+	end
+	if data then
+		cosOn = data.cosOn == true
+		hideOwn = data.hideOwn == true
+	end
+	F.paintCosToggle()
+	F.updateWornLabel()
+	pcall(F.refreshCosList)
+	setStatus("Выбери эмоции и нажми ВКЛ.", true)
+end)
+F.refreshAnimators()
